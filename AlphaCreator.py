@@ -123,28 +123,33 @@ class AlphaCreator:
         logging.info(f"Retrieved {len(datafields_df)} data fields.")
         return datafields_df
     
-    def generate_alpha_expressions(self, goodwill_list, fundamental_datafields):
+    def generate_alpha_expressions(self):
         """
-        Generates Alpha expressions based on the provided template and lists.
+        Generates Alpha expressions based on a complex template and parameter lists.
         
-        Args:
-            goodwill_list: A list of goodwill data field names.
-            fundamental_datafields: A list of data field names from the fundamental dataset.
-            
         Returns:
             list: A list of Alpha expressions.
         """
         alpha_expressions = []
         
-        # New Alpha template
-        template = "-ts_backfill(zscore({goodwill}/sales), 65) + 0.5 * (rank({fundamental2}))"
-        
-        # Iterate through all combinations of goodwill and fundamental2
-        for goodwill in goodwill_list:
-            for fundamental2 in fundamental_datafields:
-                # Use .format() to insert the variables into the template
-                expression = template.format(goodwill=goodwill, fundamental2=fundamental2)
-                alpha_expressions.append(expression)
+        windows = list(range(15, 26))
+        ks = [1, 1.5, 2, 2.5, 3]
+        tps = ['(high + low + close) / 3', '(high + low + open + close) / 4']
+        ops = ['', 'normalize', 'quantile', 'rank', 'scale', 'winsorize', 'zscore']
+
+        for window in windows:
+            for k in ks:
+                for tp in tps:
+                    for op in ops:
+                        expression = (
+                            f"window = {window};\n"
+                            f"tp = {tp};\n"
+                            f"MA = ts_mean(tp, window);\n"
+                            f"BOLU = MA + {k} * ts_std_dev(tp, window);\n"
+                            f"BOLD = MA - {k} * ts_std_dev(tp, window);\n"
+                            f"and(tp / BOLU < 1, tp / BOLD > 1) ? 0 : (tp / BOLU > 1 ? -({op}((tp - BOLU) / BOLU)) : ({op}((BOLD - tp) / BOLD)))"
+                        )
+                        alpha_expressions.append(expression)
 
         logging.info(f"Generated {len(alpha_expressions)} Alpha expressions.")
         print(f"There are a total of {len(alpha_expressions)} alpha expressions.")
@@ -236,48 +241,20 @@ class AlphaCreator:
         Returns:
             bool: Whether the process was successful.
         """
-        # Configure search scope (user can modify here directly)
-        search_scope = {
-            'region': 'USA', 
-            'delay': '1', 
-            'universe': 'TOP3000', 
-            'instrumentType': 'EQUITY'
-        }
-        
-        # Configure dataset ID and goodwill list
-        dataset_id = 'fundamental2'
-        goodwill_list = ['fnd6_newa1v1300_gdwl', 'fnd6_gdwls', 'fnd6_newqeventv110_gdwlq', 'fnd6_newqv1300_gdwlq']
-
-        print(f"Using dataset ID: {dataset_id}")
-        print(f"Using goodwill list: {goodwill_list}")
-        print(f"Search scope: {search_scope}")
-        
         try:
             # 1. Sign in
             if not self.sign_in():
                 return False
             
-            # 2. Get data fields
-            print("Getting data fields...")
-            datafields_df = self.get_datafields(search_scope, dataset_id)
-            if datafields_df is None or datafields_df.empty:
-                logging.error("Failed to get data fields.")
-                return False
-            
-            # 3. Filter for MATRIX type data fields
-            matrix_fields = datafields_df[datafields_df['type'] == "MATRIX"]
-            datafields_list = matrix_fields['id'].values
-            print(f"Found {len(datafields_list)} MATRIX type data fields from dataset '{dataset_id}'.")
-            
-            # 4. Generate Alpha expressions
+            # 2. Generate Alpha expressions
             print("Generating Alpha expressions...")
-            alpha_expressions = self.generate_alpha_expressions(goodwill_list, datafields_list)
+            alpha_expressions = self.generate_alpha_expressions()
             
-            # 5. Create the list of Alpha objects
+            # 3. Create the list of Alpha objects
             print("Creating Alpha objects...")
             self.create_alpha_list(alpha_expressions)
             
-            # 6. Save to a CSV file
+            # 4. Save to a CSV file
             print("Saving to CSV file...")
             return self.save_alphas_to_csv(filename)
             

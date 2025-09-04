@@ -124,6 +124,8 @@ alpha_list_pending_simulated.csv
 simulated_alphas_*.csv
 
 # 分析报告文件（不同步到GitHub）
+analyzer/alpha_analysis_report.md
+analyzer/correlation_check_results.txt
 analyzer/*.png
 analyzer/*.csv
 analyzer/*.jpg
