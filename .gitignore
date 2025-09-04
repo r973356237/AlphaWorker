@@ -125,6 +125,7 @@ simulated_alphas_*.csv
 
 # 分析报告文件（不同步到GitHub）
 analyzer/alpha_analysis_report.md
+analyzer/wait_list.md
 analyzer/*.png
 analyzer/*.csv
 analyzer/*.jpg
