@@ -103,56 +103,67 @@ class AlphaCreator:
                           f"&instrumentType={instrument_type}"
                           f"&region={region}&delay={str(delay)}&universe={universe}&dataset.id={dataset_id}&limit=50"
                           "&offset={x}")
-            count = self.session.get(url_template.format(x=0)).json()['count']
+            count_response = self.session.get(url_template.format(x=0))
+            count_response.raise_for_status()
+            count = count_response.json()['count']
         else:
             url_template = ("https://api.worldquantbrain.com/data-fields?"
                           f"&instrumentType={instrument_type}"
                           f"&region={region}&delay={str(delay)}&universe={universe}&limit=50"
                           f"&search={search}"
                           "&offset={x}")
-            count = 100
+            count_response = self.session.get(url_template.format(x=0))
+            count_response.raise_for_status()
+            count = count_response.json()['count']
         
         datafields_list = []
         for x in range(0, count, 50):
-            datafields = self.session.get(url_template.format(x=x))
-            datafields_list.append(datafields.json()['results'])
+            datafields_response = self.session.get(url_template.format(x=x))
+            datafields_response.raise_for_status()
+            datafields_list.append(datafields_response.json()['results'])
         
         datafields_list_flat = [item for sublist in datafields_list for item in sublist]
         datafields_df = pd.DataFrame(datafields_list_flat)
         
-        logging.info(f"Retrieved {len(datafields_df)} data fields.")
+        logging.info(f"Retrieved {len(datafields_df)} data fields for search '{search}' in dataset '{dataset_id}'.")
         return datafields_df
     
-    def generate_alpha_expressions(self):
+    def generate_alpha_expressions(self, socialmedia_data):
         """
-        Generates Alpha expressions based on a complex template and parameter lists.
+        Generates Alpha expressions based on the new template and parameter lists.
         
+        Args:
+            socialmedia_data (list): A list of social media data field names.
+            
         Returns:
             list: A list of Alpha expressions.
         """
         alpha_expressions = []
         
-        windows = list(range(15, 26))
-        ks = [1, 1.5, 2, 2.5, 3]
-        tps = ['(high + low + close) / 3', '(high + low + open + close) / 4']
-        ops = ['', 'normalize', 'quantile', 'rank', 'scale', 'winsorize', 'zscore']
+        # Parameter lists from the image
+        group_compare_op = ['group_rank', 'group_zscore', 'group_neutralize']
+        ts_compare_op = ['ts_rank', 'ts_zscore', 'ts_av_diff']
+        days = [120, 180]
+        group = ['market', 'industry', 'subindustry', 'sector', 'bucket(rank(cap),range="0,1,0.1")']
 
-        for window in windows:
-            for k in ks:
-                for tp in tps:
-                    for op in ops:
-                        expression = (
-                            f"window = {window};\n"
-                            f"tp = {tp};\n"
-                            f"MA = ts_mean(tp, window);\n"
-                            f"BOLU = MA + {k} * ts_std_dev(tp, window);\n"
-                            f"BOLD = MA - {k} * ts_std_dev(tp, window);\n"
-                            f"and(tp / BOLU < 1, tp / BOLD > 1) ? 0 : (tp / BOLU > 1 ? -({op}((tp - BOLU) / BOLU)) : ({op}((BOLD - tp) / BOLD)))"
-                        )
-                        alpha_expressions.append(expression)
+        # Nested loops to iterate through all combinations
+        for sm in socialmedia_data:
+            for d in days:
+                for gco in group_compare_op:
+                    for tco in ts_compare_op:
+                        for grp in group:
+                            # Build the expression step-by-step as shown in the template logic
+                            part1 = f"vhat=ts_regression(volume,ts_delay({sm},1),{d});"
+                            part2 = f"ehat=ts_regression(returns,vhat,{d});"
+                            # CORRECTED THIS LINE: Removed parentheses around {gco}
+                            part3 = f"alpha={gco}(-ehat*{tco}(volume,5),{grp});"
+                            part4 = "trade_when(abs(returns)<0.075,alpha,abs(returns)>0.1)"
+                            
+                            expression = part1 + part2 + part3 + part4
+                            alpha_expressions.append(expression)
 
         logging.info(f"Generated {len(alpha_expressions)} Alpha expressions.")
-        print(f"There are a total of {len(alpha_expressions)} alpha expressions.")
+        print(f"there are total {len(alpha_expressions)} alpha expressions")
         
         return alpha_expressions
     
@@ -245,16 +256,20 @@ class AlphaCreator:
             # 1. Sign in
             if not self.sign_in():
                 return False
-            
-            # 2. Generate Alpha expressions
+
+            # 2. Define the list of social media data fields as per the image
+            socialmedia_data = ['scl12_buzz', 'scl12_sentiment', 'snt_buzz', 'snt_buzz_bfl', 'snt_buzz_ret', 'snt_value']
+            print(f"Using a fixed list of {len(socialmedia_data)} social media data fields.")
+
+            # 3. Generate Alpha expressions
             print("Generating Alpha expressions...")
-            alpha_expressions = self.generate_alpha_expressions()
+            alpha_expressions = self.generate_alpha_expressions(socialmedia_data)
             
-            # 3. Create the list of Alpha objects
+            # 4. Create the list of Alpha objects
             print("Creating Alpha objects...")
             self.create_alpha_list(alpha_expressions)
             
-            # 4. Save to a CSV file
+            # 5. Save to a CSV file
             print("Saving to CSV file...")
             return self.save_alphas_to_csv(filename)
             
@@ -275,6 +290,6 @@ if __name__ == "__main__":
     if success:
         print("Alpha creation and saving completed!")
         print(f"Number of Alphas generated: {len(creator.alpha_list)}")
-        print("File has been saved as: alpha_list_pending_simulated.csv")
+        print(f"File has been saved as: alpha_list_pending_simulated.csv")
     else:
         print("Alpha creation failed, please check the log file alpha_creator.log")

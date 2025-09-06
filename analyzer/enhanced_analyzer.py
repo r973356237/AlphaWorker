@@ -1,18 +1,16 @@
 import pandas as pd
 import ast
 import glob
-import matplotlib.pyplot as plt
-import seaborn as sns
 from datetime import datetime
 
 def find_csv_file():
-    """在当前文件夹中查找CSV文件。"""
-    csv_files = glob.glob('*.csv')
+    """在当前文件夹中查找以 'simulated_alphas_' 开头的CSV文件。"""
+    csv_files = glob.glob('simulated_alphas_*.csv')
     if not csv_files:
-        print("错误：在当前文件夹中未找到任何CSV文件。")
+        print("错误：在当前文件夹中未找到任何以 'simulated_alphas_' 开头的CSV文件。")
         return None
     if len(csv_files) > 1:
-        print(f"警告：找到多个CSV文件: {csv_files}")
+        print(f"警告：找到多个以 'simulated_alphas_' 开头的CSV文件: {csv_files}")
         print(f"将使用第一个文件进行分析: {csv_files[0]}")
     return csv_files[0]
 
@@ -68,45 +66,7 @@ def parse_data(filename):
         print(f"解析数据时出错: {e}")
         return None
 
-def create_visualizations(df):
-    """根据分析结果生成并保存全英文标题的图表。"""
-    print("正在生成可视化图表 (英文)...")
-    sns.set_style("whitegrid")
 
-    # 1. Grade Distribution Chart
-    plt.figure(figsize=(10, 6))
-    sns.countplot(data=df, x='grade', hue='grade', order=df['grade'].value_counts().index, palette='viridis', legend=False)
-    plt.title('Alpha Grade Distribution', fontsize=16)
-    plt.xlabel('Grade')
-    plt.ylabel('Count')
-    grade_dist_filename = "alpha_grade_distribution.png"
-    plt.savefig(grade_dist_filename, bbox_inches='tight')
-    print(f"Grade分布图已保存为: {grade_dist_filename}")
-    plt.close()
-
-    # 2. Core Metric Distribution Charts
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('Core Metric Distributions', fontsize=16)
-    sns.histplot(df['fitness'], kde=True, ax=axes[0], color='skyblue').set_title('Fitness Distribution')
-    sns.histplot(df['sharpe'], kde=True, ax=axes[1], color='salmon').set_title('Sharpe Distribution')
-    sns.histplot(df['turnover'], kde=True, ax=axes[2], color='lightgreen').set_title('Turnover Distribution')
-    dist_filename = "alpha_distributions.png"
-    plt.savefig(dist_filename, bbox_inches='tight')
-    print(f"指标分布图已保存为: {dist_filename}")
-    plt.close()
-
-    # 3. Core Metric Correlation Charts
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('Core Metric Correlations', fontsize=16)
-    sns.scatterplot(x='fitness', y='sharpe', data=df, ax=axes[0], alpha=0.6).set_title('Fitness vs. Sharpe')
-    sns.scatterplot(x='turnover', y='sharpe', data=df, ax=axes[1], alpha=0.6).set_title('Turnover vs. Sharpe')
-    sns.scatterplot(x='drawdown', y='returns', data=df, ax=axes[2], alpha=0.6).set_title('Drawdown vs. Returns (Risk vs. Reward)')
-    corr_filename = "alpha_correlations.png"
-    plt.savefig(corr_filename, bbox_inches='tight')
-    print(f"指标相关性图已保存为: {corr_filename}")
-    plt.close()
-    
-    return grade_dist_filename, dist_filename, corr_filename
 
 def main():
     """主分析函数"""
@@ -124,8 +84,27 @@ def main():
         f.write(f"**报告生成时间:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"**分析文件:** `{filename}`\n\n")
 
-        # 1. 数据总览
-        f.write("## 1. 数据总览\n\n")
+        # 计算排名和综合分数
+        df['returns_to_drawdown'] = df['returns'] / df['drawdown']
+        df['fitness_rank'] = df['fitness'].rank(ascending=False, method='first')
+        df['sharpe_rank'] = df['sharpe'].rank(ascending=False, method='first')
+        df['r_dd_rank'] = df['returns_to_drawdown'].rank(ascending=False, method='first')
+        df['comprehensive_score'] = df['fitness_rank'] + df['sharpe_rank'] + df['r_dd_rank']
+        df['all_checks_passed'] = df['fail_count'].apply(lambda x: '是' if x == 0 else '否')
+
+        # 1. 所有检查通过的Alpha列表 (移到最前面)
+        f.write("## 1. 所有检查通过的Alpha列表\n\n")
+        all_pass_df = df[df['fail_count'] == 0].copy()
+        
+        if not all_pass_df.empty:
+            all_pass_cols = ['id', 'grade', 'fitness', 'sharpe', 'returns_to_drawdown', 'comprehensive_score']
+            f.write(f"共有 **{len(all_pass_df)}** 个Alpha通过了所有检查项，按综合分数排序如下：\n\n")
+            f.write("```\n" + all_pass_df.sort_values(by='comprehensive_score')[all_pass_cols].to_string(index=False) + "\n```\n\n")
+        else:
+            f.write("未发现任何通过所有检查项的Alpha。\n\n")
+
+        # 2. 数据总览
+        f.write("## 2. 数据总览\n\n")
         f.write(f"- **Alpha 总数:** {len(df)}\n\n")
         f.write(f"- **不同 'grade' 评级分布:**\n\n")
         f.write("```\n" + df['grade'].value_counts().to_string() + "\n```\n\n")
@@ -136,21 +115,14 @@ def main():
         fail_counts_dist.name = "Alpha数量"
         f.write("```\n" + fail_counts_dist.to_string() + "\n```\n\n")
 
-        # 2. 核心性能指标统计
-        f.write("## 2. 核心性能指标统计分析\n\n")
+        # 3. 核心性能指标统计
+        f.write("## 3. 核心性能指标统计分析\n\n")
         metrics_to_describe = ['fitness', 'sharpe', 'returns', 'turnover', 'drawdown']
         f.write("```\n" + df[metrics_to_describe].describe().to_string() + "\n```\n\n")
 
-        # 3. 多维度Top 10 Alpha展示
-        f.write("## 3. 多维度排行榜 Top 10\n\n")
+        # 4. 多维度Top 10 Alpha展示
+        f.write("## 4. 多维度排行榜 Top 10\n\n")
         
-        df['returns_to_drawdown'] = df['returns'] / df['drawdown']
-        df['fitness_rank'] = df['fitness'].rank(ascending=False, method='first')
-        df['sharpe_rank'] = df['sharpe'].rank(ascending=False, method='first')
-        df['r_dd_rank'] = df['returns_to_drawdown'].rank(ascending=False, method='first')
-        df['comprehensive_score'] = df['fitness_rank'] + df['sharpe_rank'] + df['r_dd_rank']
-        df['all_checks_passed'] = df['fail_count'].apply(lambda x: '是' if x == 0 else '否')
-
         comp_cols = ['id', 'grade', 'all_checks_passed', 'fail_count', 'comprehensive_score', 'fitness_rank', 'sharpe_rank', 'r_dd_rank']
         perf_cols = ['id', 'grade', 'all_checks_passed', 'fitness', 'sharpe']
         risk_cols = ['id', 'grade', 'all_checks_passed', 'returns_to_drawdown', 'returns', 'drawdown']
@@ -173,25 +145,8 @@ def main():
         f.write("### Fitness 排行 Top 10\n\n```\n" + df.sort_values(by='fitness', ascending=False).head(10)[perf_cols].to_string(index=False) + "\n```\n\n")
         f.write("### Sharpe 排行 Top 10\n\n```\n" + df.sort_values(by='sharpe', ascending=False).head(10)[perf_cols].to_string(index=False) + "\n```\n\n")
         f.write("### 收益/回撤比 排行 Top 10\n\n```\n" + df.sort_values(by='returns_to_drawdown', ascending=False).head(10)[risk_cols].to_string(index=False) + "\n```\n\n")
-        
-        # 4. 所有检查通过的Alpha列表
-        f.write("## 4. 所有检查通过的Alpha列表\n\n")
-        all_pass_df = df[df['fail_count'] == 0].copy()
-        
-        if not all_pass_df.empty:
-            all_pass_cols = ['id', 'grade', 'fitness', 'sharpe', 'returns_to_drawdown', 'comprehensive_score']
-            f.write(f"共有 **{len(all_pass_df)}** 个Alpha通过了所有检查项，按综合分数排序如下：\n\n")
-            f.write("```\n" + all_pass_df.sort_values(by='comprehensive_score')[all_pass_cols].to_string(index=False) + "\n```\n\n")
-        else:
-            f.write("未发现任何通过所有检查项的Alpha。\n\n")
 
-        # 5. 可视化分析
-        f.write("## 5. 可视化分析\n\n")
-        grade_file, dist_file, corr_file = create_visualizations(df)
-        f.write(f"详细的图表分析已生成并保存为图片文件，请在当前文件夹中查看：\n\n")
-        f.write(f"- **Grade评级分布图:** `{grade_file}`\n")
-        f.write(f"- **核心指标分布图:** `{dist_file}`\n")
-        f.write(f"- **核心指标相关性图:** `{corr_file}`\n")
+
 
     print(f"\n分析全部完成！详细报告已保存到文件: {report_filename}")
 
