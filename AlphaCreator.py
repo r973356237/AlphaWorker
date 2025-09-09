@@ -128,60 +128,51 @@ class AlphaCreator:
         logging.info(f"Retrieved {len(datafields_df)} data fields for search '{search}' in dataset '{dataset_id}'.")
         return datafields_df
     
-    def generate_alpha_expressions(self, socialmedia_data):
+    def generate_alpha_expressions(self, fundamental2_datafields):
         """
-        Generates Alpha expressions based on the new template and parameter lists.
+        Generates a list of (expression, group) tuples based on the new template.
         
         Args:
-            socialmedia_data (list): A list of social media data field names.
+            fundamental2_datafields (list): A list of data field names from the fundamental2 dataset.
             
         Returns:
-            list: A list of Alpha expressions.
+            list: A list of (expression, group) tuples.
         """
-        alpha_expressions = []
+        expressions_with_settings = []
         
-        # Parameter lists from the image
-        group_compare_op = ['group_rank', 'group_zscore', 'group_neutralize']
-        ts_compare_op = ['ts_rank', 'ts_zscore', 'ts_av_diff']
-        days = [120, 180]
-        group = ['market', 'industry', 'subindustry', 'sector', 'bucket(rank(cap),range="0,1,0.1")']
+        # Parameter lists to fill the template
+        datafield_list = ['fnd6_newa1v1300_gdwl', 'fnd6_newqv1300_gdwlq', 'fnd6_acqgdwl', 'goodwill']
+        group_list = ['SUBINDUSTRY', 'INDUSTRY', 'SECTOR', 'MARKET']
+        
+        template = "-ts_backfill(zscore({datafield}/sales), 65) + (rank({fundamental2})*rank(capex)*rank(dividend/sharesout)+rank(debt_st))"
 
         # Nested loops to iterate through all combinations
-        for sm in socialmedia_data:
-            for d in days:
-                for gco in group_compare_op:
-                    for tco in ts_compare_op:
-                        for grp in group:
-                            # Build the expression step-by-step as shown in the template logic
-                            part1 = f"vhat=ts_regression(volume,ts_delay({sm},1),{d});"
-                            part2 = f"ehat=ts_regression(returns,vhat,{d});"
-                            # CORRECTED THIS LINE: Removed parentheses around {gco}
-                            part3 = f"alpha={gco}(-ehat*{tco}(volume,5),{grp});"
-                            part4 = "trade_when(abs(returns)<0.075,alpha,abs(returns)>0.1)"
-                            
-                            expression = part1 + part2 + part3 + part4
-                            alpha_expressions.append(expression)
+        for group in group_list:
+            for dfield in datafield_list:
+                for f2field in fundamental2_datafields:
+                    expression = template.format(datafield=dfield, fundamental2=f2field)
+                    expressions_with_settings.append((expression, group))
 
-        logging.info(f"Generated {len(alpha_expressions)} Alpha expressions.")
-        print(f"there are total {len(alpha_expressions)} alpha expressions")
+        logging.info(f"Generated {len(expressions_with_settings)} Alpha expressions with corresponding settings.")
+        print(f"There are a total of {len(expressions_with_settings)} alpha expressions.")
         
-        return alpha_expressions
+        return expressions_with_settings
     
-    def create_alpha_list(self, alpha_expressions):
+    def create_alpha_list(self, expressions_with_settings):
         """
-        Creates a list of Alpha objects by wrapping the expressions.
+        Creates a list of Alpha objects, applying the specific neutralization group for each.
         
         Args:
-            alpha_expressions: A list of Alpha expressions.
+            expressions_with_settings: A list of (expression, group) tuples.
             
         Returns:
             list: A list of complete Alpha objects.
         """
         alpha_list = []
         
-        for index, alpha_expression in enumerate(alpha_expressions, start=1):
+        for index, (expression, group) in enumerate(expressions_with_settings, start=1):
             if index % 1000 == 0:  # Print progress every 1000 alphas
-                print(f"Processing the {index}-th Alpha expression.")
+                print(f"Processing the {index}-th Alpha object.")
                 
             simulation_data = {
                 "type": "REGULAR",
@@ -191,7 +182,7 @@ class AlphaCreator:
                     "universe": "TOP3000",
                     "delay": 1,
                     "decay": 0,
-                    "neutralization": "SUBINDUSTRY",
+                    "neutralization": group,  # Dynamically set the neutralization group here
                     "truncation": 0.01,
                     "pasteurization": "ON",
                     "unitHandling": "VERIFY",
@@ -199,7 +190,7 @@ class AlphaCreator:
                     "language": "FASTEXPR",
                     "visualization": False,
                 },
-                "regular": alpha_expression
+                "regular": expression
             }
             alpha_list.append(simulation_data)
         
@@ -229,9 +220,12 @@ class AlphaCreator:
                 # Write header
                 writer.writeheader()
                 
-                # Write data
+                # Write data, converting settings dict to string for CSV
                 for alpha in self.alpha_list:
-                    writer.writerow(alpha)
+                    # Make a copy to avoid modifying the original list
+                    writable_alpha = alpha.copy()
+                    writable_alpha['settings'] = json.dumps(writable_alpha['settings'])
+                    writer.writerow(writable_alpha)
             
             logging.info(f"Successfully saved {len(self.alpha_list)} Alphas to file {filename}.")
             print(f"Successfully saved {len(self.alpha_list)} Alphas to file {filename}.")
@@ -252,22 +246,45 @@ class AlphaCreator:
         Returns:
             bool: Whether the process was successful.
         """
+        # Define simulation settings
+        search_scope = {
+            'region': 'USA', 
+            'delay': '1', 
+            'universe': 'TOP3000', 
+            'instrumentType': 'EQUITY'
+        }
+
         try:
             # 1. Sign in
             if not self.sign_in():
                 return False
 
-            # 2. Define the list of social media data fields as per the image
-            socialmedia_data = ['scl12_buzz', 'scl12_sentiment', 'snt_buzz', 'snt_buzz_bfl', 'snt_buzz_ret', 'snt_value']
-            print(f"Using a fixed list of {len(socialmedia_data)} social media data fields.")
+            # 2. Get data fields from the 'fundamental2' dataset
+            print("Getting data fields from 'fundamental2' dataset...")
+            fundamental2_df = self.get_datafields(search_scope, dataset_id='fundamental2')
+
+            if fundamental2_df is None or fundamental2_df.empty:
+                logging.error("Failed to retrieve data fields from 'fundamental2'. Aborting.")
+                print("Could not find any data fields in dataset 'fundamental2'.")
+                return False
+
+            # Filter for MATRIX type data fields
+            matrix_fields = fundamental2_df[fundamental2_df['type'] == "MATRIX"]
+            if matrix_fields.empty:
+                logging.error("No MATRIX type data fields found in 'fundamental2'.")
+                print("No MATRIX type data fields found. These are required for the alpha expressions.")
+                return False
+
+            fundamental2_data_list = matrix_fields['id'].tolist()
+            print(f"Found {len(fundamental2_data_list)} MATRIX-type data fields from the dataset.")
 
             # 3. Generate Alpha expressions
-            print("Generating Alpha expressions...")
-            alpha_expressions = self.generate_alpha_expressions(socialmedia_data)
+            print("Generating Alpha expressions and settings...")
+            expressions_with_settings = self.generate_alpha_expressions(fundamental2_data_list)
             
             # 4. Create the list of Alpha objects
-            print("Creating Alpha objects...")
-            self.create_alpha_list(alpha_expressions)
+            print("Creating Alpha objects with dynamic settings...")
+            self.create_alpha_list(expressions_with_settings)
             
             # 5. Save to a CSV file
             print("Saving to CSV file...")

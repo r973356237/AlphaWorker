@@ -3,20 +3,13 @@ import logging
 import time
 import csv
 import os
-import ast
-from datetime import datetime # Presumed import for __init__
-
-# Note: The following variables used in __init__ are not defined in the provided snippets.
-# They are likely defined elsewhere in the user's full script.
-# loc_dt = datetime.now()
-# fmt = '%Y%m%d'
+import json
+from datetime import datetime
 
 class AlphaSimulator:
     def __init__(self, max_concurrent, username, password, alpha_list_file_path, batch_number_for_every_queue):
         self.fail_alphas = 'fail_alphas.csv'
-        # Assuming 'loc_dt' and 'fmt' are defined elsewhere, e.g., globally
-        # self.simulated_alphas = f'simulated_alphas_{loc_dt.strftime(fmt)}.csv'
-        self.simulated_alphas = f'simulated_alphas_{datetime.now().strftime("%Y%m%d")}.csv' # Placeholder implementation
+        self.simulated_alphas = f'simulated_alphas_{datetime.now().strftime("%Y%m%d")}.csv'
         self.max_concurrent = max_concurrent
         self.active_simulations = []
         self.username = username
@@ -30,182 +23,219 @@ class AlphaSimulator:
         s = requests.Session()
         s.auth = (username, password)
         count = 0
-        count_limit = 30
-        while True:
+        count_limit = 5
+        while count < count_limit:
             try:
                 response = s.post('https://api.worldquantbrain.com/authentication')
                 response.raise_for_status()
-                break
-            except:
+                logging.info("Login to BRAIN successfully.")
+                return s
+            except requests.exceptions.RequestException as e:
                 count += 1
-                logging.warning("Connection down, trying to login again...")
+                logging.warning(f"Connection down, trying to login again... Error: {e} (Attempt {count}/{count_limit})")
                 time.sleep(15)
-                if count > count_limit:
-                    logging.error(f"{username} failed too many times, returning None.")
-                    return None
-        logging.info("Login to BRAIN successfully.")
-        return s
+        
+        logging.error(f"{username} failed to log in after {count_limit} attempts. Returning None.")
+        return None
 
     def read_alphas_from_csv_in_batches(self, batch_size=50):
-        """
-        1. 打开alpha_list_pending_simulated
-        2. 取出batch_size个alpha, 放入列表变量alphas
-        3. 取出后要写(overwrite)回alpha_list_pending_simulated
-        4. 把取出的alphas, 写到sim_queue.csv文件中, 方便监控在排队的alpha有多少
-        5. 返回列表变量alphas
-        """
         alphas = []
+        if not os.path.exists(self.alpha_list_file_path):
+            return alphas
+            
         temp_file_name = self.alpha_list_file_path + '.tmp'
         try:
-            with open(self.alpha_list_file_path, 'r') as file, open(temp_file_name, 'w', newline='') as temp_file:
+            with open(self.alpha_list_file_path, 'r', newline='') as file, open(temp_file_name, 'w', newline='') as temp_file:
                 reader = csv.DictReader(file)
                 fieldnames = reader.fieldnames
+                if not fieldnames:
+                    return []
+                
                 writer = csv.DictWriter(temp_file, fieldnames=fieldnames)
                 writer.writeheader()
+                
                 for _ in range(batch_size):
                     try:
                         row = next(reader)
-                        if 'settings' in row:
-                            if isinstance(row['settings'], str):
-                                try:
-                                    row['settings'] = ast.literal_eval(row['settings'])
-                                except (ValueError, SyntaxError):
-                                    print(f"Error evaluating settings: {row['settings']}")
-                            elif isinstance(row['settings'], dict):
-                                pass
-                            else:
-                                print(f"Unexpected type for settings: {type(row['settings'])}")
+                        if 'settings' in row and isinstance(row['settings'], str):
+                            try:
+                                row['settings'] = json.loads(row['settings'])
+                            except json.JSONDecodeError:
+                                logging.error(f"Error decoding settings JSON: {row['settings']}")
+                                continue
                         alphas.append(row)
                     except StopIteration:
                         break
+                
                 for remaining_row in reader:
                     writer.writerow(remaining_row)
+
             os.replace(temp_file_name, self.alpha_list_file_path)
-            if alphas:
-                # This part seems to be for monitoring and is not directly used by other methods
-                with open('sim_queue.csv', 'w', newline='') as file:
-                    writer = csv.DictWriter(file, fieldnames=alphas[0].keys())
-                    if file.tell() == 0:
-                        writer.writeheader()
-                    writer.writerows(alphas)
-        except FileNotFoundError:
-            logging.error(f"File not found: {self.alpha_list_file_path}")
+
+        except Exception as e:
+            logging.error(f"An unexpected error occurred in read_alphas_from_csv_in_batches: {e}")
+            if os.path.exists(temp_file_name):
+                os.remove(temp_file_name)
+
         return alphas
 
     def simulate_alpha(self, alpha):
-        count = 0
-        while True:
-            try:
-                response = self.session.post('https://api.worldquantbrain.com/simulations', json=alpha)
-                response.raise_for_status()
-                if "location" in response.headers:
-                    logging.info("Alpha location retrieved successfully.")
-                    logging.info(f"Location: {response.headers['Location']}")
-                    return response.headers['Location']
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Error in sending simulation request: {e}")
-                if count > 35:
-                    self.session = self.sign_in(self.username, self.password)
-                    logging.error("Error occurred too many times, skipping this alpha and re-logging in.")
-                    break
-                logging.error("Error in sending simulation request. Retrying after 5s...")
-                time.sleep(5)
-                count += 1
-        logging.error(f"Simulation request failed after {count} attempts.")
-        with open(self.fail_alphas, 'a', newline='') as file:
-            writer = csv.DictWriter(file, fieldnames=alpha.keys())
-            writer.writerow(alpha)
+        """Sends a simulation request with re-login logic for 401 errors."""
+        try:
+            response = self.session.post('https://api.worldquantbrain.com/simulations', json=alpha)
+            response.raise_for_status()
+            return response.headers.get("location")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                logging.warning("Session expired (401 Unauthorized). Re-logging in...")
+                self.session = self.sign_in(self.username, self.password)
+                if self.session:
+                    logging.info("Re-login successful. Retrying simulation request...")
+                    try:
+                        response = self.session.post('https://api.worldquantbrain.com/simulations', json=alpha)
+                        response.raise_for_status()
+                        return response.headers.get("location")
+                    except requests.exceptions.RequestException as retry_e:
+                        logging.error(f"Simulation request failed even after re-login: {retry_e}")
+                else:
+                    logging.error("Failed to re-login. Skipping alpha.")
+            else:
+                logging.error(f"HTTP Error during simulation request: {e}")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"A network error occurred during simulation request: {e}")
+
+        # If any error occurred and was not resolved, log the alpha as failed.
+        self.log_failed_alpha(alpha)
         return None
 
+    def log_failed_alpha(self, alpha):
+        """Logs a failed alpha to the fail_alphas.csv file."""
+        logging.error(f"Logging failed alpha: {alpha.get('regular')}")
+        try:
+            # Ensure settings is a string for CSV writing
+            if 'settings' in alpha and isinstance(alpha['settings'], dict):
+                alpha['settings'] = json.dumps(alpha['settings'])
+            
+            # Check if file exists to write header
+            file_exists = os.path.isfile(self.fail_alphas)
+            
+            with open(self.fail_alphas, 'a', newline='') as file:
+                writer = csv.DictWriter(file, fieldnames=alpha.keys())
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(alpha)
+        except Exception as e:
+            logging.error(f"Could not write to fail_alphas.csv: {e}")
+
     def load_new_alpha_and_simulate(self):
-        if len(self.sim_queue_ls) < 1:
+        if not self.sim_queue_ls:
             self.sim_queue_ls = self.read_alphas_from_csv_in_batches(self.batch_number_for_every_queue)
+            if not self.sim_queue_ls:
+                return # No more alphas to load
 
         if len(self.active_simulations) >= self.max_concurrent:
-            logging.info(f"Max concurrent simulations reached ({self.max_concurrent}). Waiting 2 seconds")
-            time.sleep(2)
             return
 
-        logging.info('loading new alpha...')
-        try:
-            alpha = self.sim_queue_ls.pop(0)
-            logging.info(f"Starting simulation for alpha: {alpha.get('regular')} with settings: {alpha.get('settings')}")
-            location_url = self.simulate_alpha(alpha)
-            if location_url:
-                self.active_simulations.append(location_url)
-        except IndexError:
-            logging.info("No more alphas available in the queue.")
+        alpha = self.sim_queue_ls.pop(0)
+        logging.info(f"Starting simulation for alpha: {alpha.get('regular')}")
+        location_url = self.simulate_alpha(alpha)
+        if location_url:
+            self.active_simulations.append(location_url)
 
     def check_simulation_progress(self, simulation_progress_url):
+        """Checks simulation progress with re-login logic for 401 errors."""
         try:
-            simulation_progress = self.session.get(simulation_progress_url)
-            simulation_progress.raise_for_status()
-            # 修复：处理Retry-After可能是浮点数字符串的情况
-            retry_after = simulation_progress.headers.get("Retry-After", "0")
-            try:
-                retry_after_value = float(retry_after)
-            except (ValueError, TypeError):
-                retry_after_value = 0.0
-            
-            if retry_after_value == 0:
-                alpha_id = simulation_progress.json().get("alpha")
-                if alpha_id:
-                    alpha_response = self.session.get(f"https://api.worldquantbrain.com/alphas/{alpha_id}")
-                    alpha_response.raise_for_status()
-                    return alpha_response.json()
+            response = self.session.get(simulation_progress_url)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                logging.warning(f"Session expired (401 Unauthorized) while checking progress for {simulation_progress_url}. Re-logging in...")
+                self.session = self.sign_in(self.username, self.password)
+                if self.session:
+                    logging.info("Re-login successful. Retrying progress check...")
+                    try:
+                        response = self.session.get(simulation_progress_url)
+                        response.raise_for_status()
+                        return response
+                    except requests.exceptions.RequestException as retry_e:
+                        logging.error(f"Progress check failed even after re-login: {retry_e}")
                 else:
-                    return simulation_progress.json()
+                    logging.error("Failed to re-login. Progress check will be retried later.")
             else:
-                return None
+                logging.error(f"HTTP Error fetching progress from {simulation_progress_url}: {e}")
         except requests.exceptions.RequestException as e:
-            logging.error(f"Error fetching simulation progress: {e}")
-            self.session = self.sign_in(self.username, self.password)
-            return None
+            logging.error(f"A network error occurred fetching progress from {simulation_progress_url}: {e}")
+        
+        return None
 
     def check_simulation_status(self):
-        count = 0
-        if len(self.active_simulations) == 0:
-            logging.info("No one is in active simulation now")
-            return None # Changed from 'return' to 'return None' for consistency
-        
-        # Use a copy of the list to iterate over, as we might modify the original list
-        for sim_url in self.active_simulations[:]:
-            sim_progress = self.check_simulation_progress(sim_url)
-            if sim_progress is None:
-                count += 1
-                continue
-            
-            # Assuming a completed simulation will have a 'status' field.
-            if sim_progress.get("status"):
-                alpha_id = sim_progress.get("id")
-                status = sim_progress.get("status")
-                logging.info(f"Alpha id: {alpha_id} ended with status: {status}. Removing from active list.")
-                self.active_simulations.remove(sim_url)
-                with open(self.simulated_alphas, 'a', newline='') as file:
-                    writer = csv.DictWriter(file, fieldnames=sim_progress.keys())
-                    # Check if file is empty to write header
-                    file.seek(0, 2) # move to end of file
-                    if file.tell() == 0:
-                        writer.writeheader()
-                    writer.writerow(sim_progress)
-            else:
-                count += 1
+        if not self.active_simulations:
+            logging.info("No active simulations to check.")
+            return
 
-        logging.info(f"Total {count} simulations are in process for account {self.username}.")
+        for sim_url in self.active_simulations[:]:
+            response = self.check_simulation_progress(sim_url)
+            
+            if response is None:
+                continue
+
+            retry_after = float(response.headers.get("Retry-After", "0"))
+            
+            if retry_after == 0:
+                self.active_simulations.remove(sim_url)
+                sim_result = response.json()
+                alpha_id = sim_result.get("alpha")
+                status = sim_result.get("status", "UNKNOWN")
+                
+                if status == "COMPLETE" and alpha_id:
+                    logging.info(f"Simulation {sim_url} completed. Alpha ID: {alpha_id}.")
+                    try:
+                        alpha_details_response = self.session.get(f"https://api.worldquantbrain.com/alphas/{alpha_id}")
+                        alpha_details_response.raise_for_status()
+                        result_data = alpha_details_response.json()
+
+                        file_exists = os.path.isfile(self.simulated_alphas)
+                        with open(self.simulated_alphas, 'a', newline='') as file:
+                            writer = csv.DictWriter(file, fieldnames=result_data.keys())
+                            if not file_exists:
+                                writer.writeheader()
+                            writer.writerow(result_data)
+                    except requests.exceptions.RequestException as e:
+                        logging.error(f"Failed to fetch details for completed alpha {alpha_id}: {e}")
+                else:
+                    logging.warning(f"Simulation {sim_url} ended with non-COMPLETE status: {status}. Details: {sim_result}")
+        
+        logging.info(f"{len(self.active_simulations)} simulations still in process for account {self.username}.")
 
     def manage_simulations(self):
         if not self.session:
-            logging.error("Failed to sign in. Exiting...")
+            logging.error("Initial sign in failed. Exiting...")
             return
+        
+        logging.info(f"🚀 Starting simulation management... max_concurrent={self.max_concurrent}, batch_size={self.batch_number_for_every_queue}")
+        
         while True:
-            self.check_simulation_status()
-            self.load_new_alpha_and_simulate()
-            time.sleep(3)
+            try:
+                self.check_simulation_status()
 
-# Example usage
-# Ensure logging is configured, e.g., logging.basicConfig(level=logging.INFO)
-# username = "YOUR_USERNAME"
-# password = "YOUR_PASSWORD"
-alpha_list_file_path = 'alpha_list_pending_simulated.csv' # replace with your actual file path
-# simulator = AlphaSimulator(max_concurrent=3, username=username, password=password, alpha_list_file_path=alpha_list_file_path, batch_number_for_every_queue=20)
-# simulator.manage_simulations()
+                while len(self.active_simulations) < self.max_concurrent:
+                    if not self.sim_queue_ls:
+                        self.sim_queue_ls = self.read_alphas_from_csv_in_batches(self.batch_number_for_every_queue)
+                        if not self.sim_queue_ls:
+                            break 
+                    self.load_new_alpha_and_simulate()
+                
+                # Check for completion condition
+                is_file_present = os.path.exists(self.alpha_list_file_path) and os.path.getsize(self.alpha_list_file_path) > 50 # Check if file exists and is not just a header
+                if not self.sim_queue_ls and not self.active_simulations and not is_file_present:
+                     logging.info("All alphas have been simulated. Shutting down.")
+                     break
+
+                time.sleep(5)
+            except KeyboardInterrupt:
+                logging.info("⏹️ Simulation process interrupted by user.")
+                break
+            except Exception as e:
+                logging.error(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
+                time.sleep(30)
