@@ -80,43 +80,48 @@ class AlphaSimulator:
         return alphas
 
     def simulate_alpha(self, alpha):
-        """Sends a simulation request with re-login logic for 401 errors."""
-        try:
-            response = self.session.post('https://api.worldquantbrain.com/simulations', json=alpha)
-            response.raise_for_status()
-            return response.headers.get("location")
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                logging.warning("Session expired (401 Unauthorized). Re-logging in...")
-                self.session = self.sign_in(self.username, self.password)
-                if self.session:
+        """Sends a simulation request with robust retry logic for 401 and 429 errors."""
+        max_retries = 5
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                response = self.session.post('https://api.worldquantbrain.com/simulations', json=alpha)
+                response.raise_for_status()
+                return response.headers.get("location") # Success
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code
+                if status_code == 401:
+                    logging.warning("Session expired (401 Unauthorized). Re-logging in...")
+                    self.session = self.sign_in(self.username, self.password)
+                    if not self.session:
+                        logging.error("Failed to re-login. Aborting this alpha.")
+                        break
                     logging.info("Re-login successful. Retrying simulation request...")
-                    try:
-                        response = self.session.post('https://api.worldquantbrain.com/simulations', json=alpha)
-                        response.raise_for_status()
-                        return response.headers.get("location")
-                    except requests.exceptions.RequestException as retry_e:
-                        logging.error(f"Simulation request failed even after re-login: {retry_e}")
+                    continue
+                elif status_code == 429:
+                    retry_after = int(e.response.headers.get("Retry-After", 60))
+                    logging.warning(f"Rate limited (429 Too Many Requests). Waiting for {retry_after} seconds...")
+                    time.sleep(retry_after)
+                    continue
                 else:
-                    logging.error("Failed to re-login. Skipping alpha.")
-            else:
-                logging.error(f"HTTP Error during simulation request: {e}")
-        except requests.exceptions.RequestException as e:
-            logging.error(f"A network error occurred during simulation request: {e}")
+                    logging.error(f"HTTP Error (status {status_code}) during simulation request: {e}")
+                    attempt += 1
+            except requests.exceptions.RequestException as e:
+                logging.error(f"A network error occurred during simulation request: {e}")
+                attempt += 1
 
-        # If any error occurred and was not resolved, log the alpha as failed.
+            if attempt < max_retries:
+                time.sleep(10)
+        
         self.log_failed_alpha(alpha)
         return None
 
     def log_failed_alpha(self, alpha):
-        """Logs a failed alpha to the fail_alphas.csv file."""
         logging.error(f"Logging failed alpha: {alpha.get('regular')}")
         try:
-            # Ensure settings is a string for CSV writing
             if 'settings' in alpha and isinstance(alpha['settings'], dict):
                 alpha['settings'] = json.dumps(alpha['settings'])
             
-            # Check if file exists to write header
             file_exists = os.path.isfile(self.fail_alphas)
             
             with open(self.fail_alphas, 'a', newline='') as file:
@@ -131,7 +136,7 @@ class AlphaSimulator:
         if not self.sim_queue_ls:
             self.sim_queue_ls = self.read_alphas_from_csv_in_batches(self.batch_number_for_every_queue)
             if not self.sim_queue_ls:
-                return # No more alphas to load
+                return
 
         if len(self.active_simulations) >= self.max_concurrent:
             return
@@ -143,14 +148,13 @@ class AlphaSimulator:
             self.active_simulations.append(location_url)
 
     def check_simulation_progress(self, simulation_progress_url):
-        """Checks simulation progress with re-login logic for 401 errors."""
         try:
             response = self.session.get(simulation_progress_url)
             response.raise_for_status()
             return response
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
-                logging.warning(f"Session expired (401 Unauthorized) while checking progress for {simulation_progress_url}. Re-logging in...")
+                logging.warning(f"Session expired (401 Unauthorized) while checking progress. Re-logging in...")
                 self.session = self.sign_in(self.username, self.password)
                 if self.session:
                     logging.info("Re-login successful. Retrying progress check...")
@@ -171,16 +175,20 @@ class AlphaSimulator:
 
     def check_simulation_status(self):
         if not self.active_simulations:
-            logging.info("No active simulations to check.")
             return
 
         for sim_url in self.active_simulations[:]:
             response = self.check_simulation_progress(sim_url)
             
             if response is None:
+                logging.warning(f"Could not get status for {sim_url}, will retry next cycle.")
                 continue
 
             retry_after = float(response.headers.get("Retry-After", "0"))
+            
+            # --- MODIFICATION START: Added detailed logging ---
+            logging.info(f"Checking {sim_url}... Status: {response.status_code}, Retry-After: {retry_after}")
+            # --- MODIFICATION END ---
             
             if retry_after == 0:
                 self.active_simulations.remove(sim_url)
@@ -206,6 +214,7 @@ class AlphaSimulator:
                 else:
                     logging.warning(f"Simulation {sim_url} ended with non-COMPLETE status: {status}. Details: {sim_result}")
         
+        # This log will now be more meaningful after the detailed per-URL logs.
         logging.info(f"{len(self.active_simulations)} simulations still in process for account {self.username}.")
 
     def manage_simulations(self):
@@ -226,8 +235,7 @@ class AlphaSimulator:
                             break 
                     self.load_new_alpha_and_simulate()
                 
-                # Check for completion condition
-                is_file_present = os.path.exists(self.alpha_list_file_path) and os.path.getsize(self.alpha_list_file_path) > 50 # Check if file exists and is not just a header
+                is_file_present = os.path.exists(self.alpha_list_file_path) and os.path.getsize(self.alpha_list_file_path) > 50
                 if not self.sim_queue_ls and not self.active_simulations and not is_file_present:
                      logging.info("All alphas have been simulated. Shutting down.")
                      break
